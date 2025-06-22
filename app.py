@@ -4,8 +4,16 @@ import matplotlib.pyplot as plt
 from prophet import Prophet
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import numpy as np
+import random
+import numpy as np
+import os
+random.seed(42)
+np.random.seed(42)
+os.environ['PYTHONHASHSEED'] = '42'
+
 
 st.title("📊 Electricity Forecasting with Prophet")
+
 st.write("Upload an Excel file with columns:")
 st.markdown("""
 - `Month` (e.g. 2020-01)
@@ -13,31 +21,34 @@ st.markdown("""
 - `Electricity Net Generation, Electric Power Sector`
 - `Electricity Exports`
 """)
+
 uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
 
-if uploaded_file:
-    df = pd.read_excel(uploaded_file)
-    try:
-        df['Month'] = pd.to_datetime(df['Month'])
-        df.set_index('Month', inplace=True)
-        df.fillna(method='ffill', inplace=True)
+def find_best_train_size(df, target, regressors, holdout=12, proportions=None):
+    if proportions is None:
+        proportions = [0.1 * i for i in range(1, 11)]
 
-        regressors = ['Electricity Net Generation, Electric Power Sector', 'Electricity Exports']
-        for reg in regressors:
-            df[f'{reg}_lag12'] = df[reg].shift(12)
+    lagged_regs = [f"{reg}_lag12" for reg in regressors]
+    for reg in regressors:
+        df[f'{reg}_lag12'] = df[reg].shift(12)
+    df.dropna(inplace=True)
 
-        df.dropna(inplace=True)
+    df_eval = df.iloc[-holdout:]
+    actual = df_eval[target].values
 
-        df_train = df.iloc[-(508 + 12):-12]
-        df_eval = df.iloc[-12:]
+    results, evaluations = [], []
 
-        target = 'Electricity Sales to Ultimate Customers'
-        lagged_regs = [f'{reg}_lag12' for reg in regressors]
+
+    for p in proportions:
+        n_rows = int(len(df) * p)
+        df_train = df.iloc[-(n_rows + holdout):-holdout]
+        if len(df_train) < 2:
+            continue
+
         train_df = df_train[[target] + lagged_regs].reset_index().rename(columns={'Month': 'ds', target: 'y'})
 
         future_df = df_eval[regressors].reset_index()
         future_df['ds'] = df_eval.index
-        future_df.drop(columns='Month', inplace=True)
         for reg in regressors:
             future_df[f'{reg}_lag12'] = future_df[reg]
         future_df = future_df[['ds'] + [f'{reg}_lag12' for reg in regressors]]
@@ -46,20 +57,74 @@ if uploaded_file:
         combined_df = pd.concat([train_df, future_df], ignore_index=True)
 
         model = Prophet()
+        model.random_seed = 42  # ensure reproducibility
         for reg in lagged_regs:
             model.add_regressor(reg)
-        model.fit(train_df)
 
-        forecast = model.predict(combined_df)
+        try:
+            model.fit(train_df)
+            forecast = model.predict(combined_df)
+            forecast_eval = forecast[forecast['ds'].isin(df_eval.index)].copy()
+            predicted = forecast_eval['yhat'].values
 
-        forecast_eval = forecast[forecast['ds'].isin(df_eval.index)].copy()
-        actual = df_eval[target].values
-        predicted = forecast_eval['yhat'].values
+            rmse = np.sqrt(mean_squared_error(actual, predicted))
+            mae = mean_absolute_error(actual, predicted)
+            mape = np.mean(np.abs((actual - predicted) / actual)) * 100
 
+            results.append((p, forecast_eval['ds'].values, predicted, model, train_df))
+            evaluations.append((p, rmse, mae, mape))
+        except Exception:
+            continue
+
+    best_p, best_rmse, best_mae, best_mape = min(evaluations, key=lambda x: x[3])
+    best_result = next(r for r in results if r[0] == best_p)
+    best_model, best_train_df = best_result[3], best_result[4]
+
+    return {
+        "best_train_proportion": best_p,
+        "best_rmse": best_rmse,
+        "best_mae": best_mae,
+        "best_mape": best_mape,
+        "model": best_model,
+        "train_df": best_train_df,
+        "actual": actual,
+        "predicted": best_result[2],
+        "eval_index": df_eval.index
+    }
+
+if uploaded_file:
+    df = pd.read_excel(uploaded_file)
+    try:
+        df['Month'] = pd.to_datetime(df['Month'])
+        df.set_index('Month', inplace=True)
+        df.fillna(method='ffill', inplace=True)
+        df.fillna(method='bfill', inplace=True)
+
+        regressors = ['Electricity Net Generation, Electric Power Sector', 'Electricity Exports']
+        target = 'Electricity Sales to Ultimate Customers'
+
+        # 🔍 Find Best Training Size Automatically
+        with st.spinner("Optimizing training size..."):
+            results = find_best_train_size(df.copy(), target, regressors)
+
+        best_p = results["best_train_proportion"]
+        model = results["model"]
+        train_df = results["train_df"]
+        actual = results["actual"]
+        predicted = results["predicted"]
+        eval_index = results["eval_index"]
+        rmse = results["best_rmse"]
+        mae = results["best_mae"]
+        mape = results["best_mape"]
+
+        st.success(f"✅ Best training proportion: {best_p:.2f}")
+        st.info(f"📦 Training samples used: {len(train_df)}")
+
+        # 🎯 Evaluation Plot
         st.subheader("📈 Actual vs Forecasted (Evaluation Period)")
         fig1, ax1 = plt.subplots(figsize=(10, 6))
-        ax1.plot(forecast_eval['ds'], actual, label='Actual', color='blue', marker='o')
-        ax1.plot(forecast_eval['ds'], predicted, label='Forecasted', color='red', marker='x')
+        ax1.plot(eval_index, actual, label='Actual', color='blue', marker='o')
+        ax1.plot(eval_index, predicted, label='Forecasted', color='red', marker='x')
         ax1.set_title('Actual vs Forecasted Electricity Sales')
         ax1.set_xlabel('Date')
         ax1.set_ylabel('Electricity Sales')
@@ -68,19 +133,13 @@ if uploaded_file:
         plt.xticks(rotation=45)
         st.pyplot(fig1)
 
-        def evaluate_model(y_true, y_pred):
-            rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-            mae = mean_absolute_error(y_true, y_pred)
-            mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
-            return rmse, mae, mape
-
-        rmse, mae, mape = evaluate_model(actual, predicted)
-
+        # 🧮 Evaluation Metrics
         st.subheader("📊 Evaluation Metrics")
         st.write(f"**RMSE:** {rmse:.2f}")
         st.write(f"**MAE:** {mae:.2f}")
         st.write(f"**MAPE:** {mape:.2f}%")
 
+        # 🔮 Future Forecast (12 months)
         last_month = df.index[-1]
         future_months = pd.date_range(start=last_month + pd.DateOffset(months=1), periods=12, freq='MS')
         future_ext = pd.DataFrame({'ds': future_months})
@@ -113,13 +172,11 @@ if uploaded_file:
             file_name='future_forecast.csv',
             mime='text/csv',
         )
-
-
         st.dataframe(table.style.format({
             'Forecast': '{:,.2f}',
             'Lower Bound': '{:,.2f}',
             'Upper Bound': '{:,.2f}'
         }))
-
+    
     except Exception as e:
         st.error(f"Error processing file: {e}")
