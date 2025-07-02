@@ -104,7 +104,7 @@ if uploaded_file:
         target = 'Electricity Sales to Ultimate Customers'
 
         # 🔍 Find Best Training Size Automatically
-        with st.spinner("Optimizing training size..."):
+        with st.spinner("Do forecasting..."):
             results = find_best_train_size(df.copy(), target, regressors)
 
         best_p = results["best_train_proportion"]
@@ -116,9 +116,6 @@ if uploaded_file:
         rmse = results["best_rmse"]
         mae = results["best_mae"]
         mape = results["best_mape"]
-
-        st.success(f"✅ Best training proportion: {best_p:.2f}")
-        st.info(f"📦 Training samples used: {len(train_df)}")
 
         # 🎯 Evaluation Plot
         st.subheader("📈 Actual vs Forecasted (Evaluation Period)")
@@ -132,12 +129,6 @@ if uploaded_file:
         ax1.legend()
         plt.xticks(rotation=45)
         st.pyplot(fig1)
-
-        # 🧮 Evaluation Metrics
-        st.subheader("📊 Evaluation Metrics")
-        st.write(f"**RMSE:** {rmse:.2f}")
-        st.write(f"**MAE:** {mae:.2f}")
-        st.write(f"**MAPE:** {mape:.2f}%")
 
         # 🔮 Future Forecast (12 months)
         last_month = df.index[-1]
@@ -177,6 +168,18 @@ if uploaded_file:
             'Lower Bound': '{:,.2f}',
             'Upper Bound': '{:,.2f}'
         }))
+
+        hide_label = "<style>div[data-testid='stExpander'] > details > summary {font-size: 0.8rem; opacity: 0.5;}</style>"
+        st.markdown(hide_label, unsafe_allow_html=True)
+
+        with st.expander("📉", expanded=False):
+            st.success(f"✅ Best training proportion: {best_p:.2f}")
+            st.info(f"📦 Training samples used: {len(train_df)}")
+            st.write(f"**RMSE:** {rmse:.2f}")
+            st.write(f"**MAE:** {mae:.2f}")
+            st.write(f"**MAPE:** {mape:.2f}%")
+
+
     
     except Exception as e:
         st.error(f"Error processing file: {e}")
