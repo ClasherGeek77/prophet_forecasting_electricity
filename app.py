@@ -1,18 +1,18 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 from prophet import Prophet
+from statsmodels.tsa.api import VAR
 from sklearn.metrics import mean_squared_error, mean_absolute_error
-import numpy as np
-import random
-import numpy as np
-import os
-random.seed(42)
-np.random.seed(42)
-os.environ['PYTHONHASHSEED'] = '42'
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Bidirectional
+from sklearn.preprocessing import MinMaxScaler
+import warnings
+warnings.filterwarnings("ignore")
 
-
-st.title("📊 Electricity Forecasting with Prophet")
+st.set_page_config(layout="wide")
+st.title("⚡ Electricity Forecasting with Auto-Ensemble")
 
 st.write("Upload an Excel file with columns:")
 st.markdown("""
@@ -22,128 +22,200 @@ st.markdown("""
 - `Electricity Exports`
 """)
 
-uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
+uploaded_file = st.file_uploader("📤 Upload Excel File", type=["xlsx"])
 
-def find_best_train_size(df, target, regressors, holdout=12, proportions=None):
-    if proportions is None:
-        proportions = [0.1 * i for i in range(1, 11)]
-
-    lagged_regs = [f"{reg}_lag12" for reg in regressors]
-    for reg in regressors:
-        df[f'{reg}_lag12'] = df[reg].shift(12)
-    df.dropna(inplace=True)
-
-    df_eval = df.iloc[-holdout:]
-    actual = df_eval[target].values
-
-    results, evaluations = [], []
-
-
-    for p in proportions:
-        n_rows = int(len(df) * p)
-        df_train = df.iloc[-(n_rows + holdout):-holdout]
-        if len(df_train) < 2:
-            continue
-
-        train_df = df_train[[target] + lagged_regs].reset_index().rename(columns={'Month': 'ds', target: 'y'})
-
-        future_df = df_eval[regressors].reset_index()
-        future_df['ds'] = df_eval.index
-        for reg in regressors:
-            future_df[f'{reg}_lag12'] = future_df[reg]
-        future_df = future_df[['ds'] + [f'{reg}_lag12' for reg in regressors]]
-        future_df['y'] = None
-
-        combined_df = pd.concat([train_df, future_df], ignore_index=True)
-
-        model = Prophet()
-        model.random_seed = 42  # ensure reproducibility
-        for reg in lagged_regs:
-            model.add_regressor(reg)
-
-        try:
-            model.fit(train_df)
-            forecast = model.predict(combined_df)
-            forecast_eval = forecast[forecast['ds'].isin(df_eval.index)].copy()
-            predicted = forecast_eval['yhat'].values
-
-            rmse = np.sqrt(mean_squared_error(actual, predicted))
-            mae = mean_absolute_error(actual, predicted)
-            mape = np.mean(np.abs((actual - predicted) / actual)) * 100
-
-            results.append((p, forecast_eval['ds'].values, predicted, model, train_df))
-            evaluations.append((p, rmse, mae, mape))
-        except Exception:
-            continue
-
-    best_p, best_rmse, best_mae, best_mape = min(evaluations, key=lambda x: x[3])
-    best_result = next(r for r in results if r[0] == best_p)
-    best_model, best_train_df = best_result[3], best_result[4]
-
-    return {
-        "best_train_proportion": best_p,
-        "best_rmse": best_rmse,
-        "best_mae": best_mae,
-        "best_mape": best_mape,
-        "model": best_model,
-        "train_df": best_train_df,
-        "actual": actual,
-        "predicted": best_result[2],
-        "eval_index": df_eval.index
-    }
+def evaluate(y_true, y_pred):
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae = mean_absolute_error(y_true, y_pred)
+    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+    return rmse, mae, mape
 
 if uploaded_file:
-    df = pd.read_excel(uploaded_file)
-    try:
+    with st.spinner("Running forecasting pipeline..."):
+        df = pd.read_excel(uploaded_file)
         df['Month'] = pd.to_datetime(df['Month'])
         df.set_index('Month', inplace=True)
         df.fillna(method='ffill', inplace=True)
         df.fillna(method='bfill', inplace=True)
 
-        regressors = ['Electricity Net Generation, Electric Power Sector', 'Electricity Exports']
         target = 'Electricity Sales to Ultimate Customers'
-
-        # 🔍 Find Best Training Size Automatically
-        with st.spinner("Do forecasting..."):
-            results = find_best_train_size(df.copy(), target, regressors)
-
-        best_p = results["best_train_proportion"]
-        model = results["model"]
-        train_df = results["train_df"]
-        actual = results["actual"]
-        predicted = results["predicted"]
-        eval_index = results["eval_index"]
-        rmse = results["best_rmse"]
-        mae = results["best_mae"]
-        mape = results["best_mape"]
-
-        # 🎯 Evaluation Plot
-        st.subheader("📈 Actual vs Forecasted (Evaluation Period)")
-        fig1, ax1 = plt.subplots(figsize=(10, 6))
-        ax1.plot(eval_index, actual, label='Actual', color='blue', marker='o')
-        ax1.plot(eval_index, predicted, label='Forecasted', color='red', marker='x')
-        ax1.set_title('Actual vs Forecasted Electricity Sales')
-        ax1.set_xlabel('Date')
-        ax1.set_ylabel('Electricity Sales')
-        ax1.grid(True)
-        ax1.legend()
-        plt.xticks(rotation=45)
-        st.pyplot(fig1)
-
-        # 🔮 Future Forecast (12 months)
-        last_month = df.index[-1]
-        future_months = pd.date_range(start=last_month + pd.DateOffset(months=1), periods=12, freq='MS')
-        future_ext = pd.DataFrame({'ds': future_months})
+        regressors = ['Electricity Net Generation, Electric Power Sector', 'Electricity Exports']
         for reg in regressors:
-            future_ext[f'{reg}_lag12'] = df[reg].iloc[-12:].values
+            df[f'{reg}_lag12'] = df[reg].shift(12)
+        df.dropna(inplace=True)
 
-        future_forecast = model.predict(future_ext)
+        df_eval = df.iloc[-12:]
+        actual = df_eval[target].values
+        proportions = np.linspace(0.1, 1.0, 10)
+
+        # Prophet
+        prophet_results = []
+        for p in proportions:
+            train_size = int(len(df) * p)
+            prophet_train = df.iloc[-(train_size + 12):-12]
+            if len(prophet_train) < 24:
+                continue
+            train_df = prophet_train[[target] + [f'{reg}_lag12' for reg in regressors]].reset_index()
+            train_df.rename(columns={'Month': 'ds', target: 'y'}, inplace=True)
+
+            future_df = df_eval[regressors].reset_index()
+            future_df['ds'] = df_eval.index
+            for reg in regressors:
+                future_df[f'{reg}_lag12'] = future_df[reg]
+            future_df = future_df[['ds'] + [f'{reg}_lag12' for reg in regressors]]
+            future_df['y'] = None
+
+            combined_df = pd.concat([train_df, future_df], ignore_index=True)
+
+            model = Prophet()
+            for reg in [f'{reg}_lag12' for reg in regressors]:
+                model.add_regressor(reg)
+            try:
+                model.fit(train_df)
+                forecast = model.predict(combined_df)
+                pred = forecast[forecast['ds'].isin(df_eval.index)]['yhat'].values
+                rmse, mae, mape = evaluate(actual, pred)
+                prophet_results.append((p, pred, rmse, mae, mape))
+            except:
+                continue
+        best_prophet = min(prophet_results, key=lambda x: x[4])
+        best_prophet_p, prophet_preds, *_ = best_prophet
+
+        # VAR
+        var_data = df[[target, 'Electricity Exports']]
+        var_results = []
+        for p in proportions:
+            train_size = int(len(var_data) * p)
+            var_train = var_data.iloc[-(train_size + 12):-12]
+            if len(var_train) < 24:
+                continue
+            try:
+                model = VAR(var_train)
+                selected_lag = model.select_order(12).selected_orders['aic']
+                results_model = model.fit(selected_lag)
+                forecast_input = var_train.values[-selected_lag:]
+                var_forecast = results_model.forecast(y=forecast_input, steps=12)
+                pred = pd.DataFrame(var_forecast, index=df_eval.index, columns=var_data.columns)[target].values
+                rmse, mae, mape = evaluate(actual, pred)
+                var_results.append((p, pred, rmse, mae, mape))
+            except:
+                continue
+        best_var = min(var_results, key=lambda x: x[4])
+        best_var_p, var_preds, *_ = best_var
+
+        # BiLSTM
+        bilstm_results = []
+        scaler = MinMaxScaler()
+        lag = 12
+        scaled_df = pd.DataFrame(scaler.fit_transform(df[[target] + regressors]),
+                                columns=[target] + regressors,
+                                index=df.index)
+        for p in [0.8]:
+            train_size = int(len(df) * p)
+            scaled_train = scaled_df.iloc[-(train_size + 12):-12]
+            if len(scaled_train) <= lag:
+                continue
+            X, y = [], []
+            for i in range(lag, len(scaled_train)):
+                X.append(scaled_train.iloc[i-lag:i].values)
+                y.append(scaled_train.iloc[i][0])
+            X, y = np.array(X), np.array(y)
+
+            model = Sequential([
+                Bidirectional(LSTM(64, activation='relu'), input_shape=(lag, X.shape[2])),
+                Dense(1)
+            ])
+            model.compile(optimizer='adam', loss='mse')
+            model.fit(X, y, epochs=100, verbose=0)
+
+            inputs = scaled_df.iloc[-lag:].values
+            preds = []
+            for _ in range(12):
+                inp = inputs[-lag:]
+                inp = inp.reshape(1, lag, X.shape[2])
+                pred_scaled = model.predict(inp, verbose=0)[0][0]
+                preds.append(pred_scaled)
+                new_row = np.concatenate([[pred_scaled], inputs[-1][1:]])
+                inputs = np.vstack([inputs, new_row])
+
+            forecast = scaler.inverse_transform(np.column_stack([preds, np.zeros((12, len(regressors)))]))[:, 0]
+            rmse, mae, mape = evaluate(actual, forecast)
+            bilstm_results.append((p, forecast, rmse, mae, mape))
+        best_bilstm = min(bilstm_results, key=lambda x: x[4])
+        best_bilstm_p, bilstm_preds, *_ = best_bilstm
+
+        # Ensemble
+        ensemble_results = []
+        weights = np.linspace(0, 1, 11)
+        for w1 in weights:
+            for w2 in weights:
+                if w1 + w2 > 1:
+                    continue
+                w3 = 1 - w1 - w2
+                blended = w1 * prophet_preds + w2 * var_preds + w3 * bilstm_preds
+                rmse, mae, mape = evaluate(actual, blended)
+                ensemble_results.append((w1, w2, w3, rmse, mae, mape))
+        best_ens = min(ensemble_results, key=lambda x: x[5])
+        best_w1, best_w2, best_w3, best_rmse, best_mae, best_mape = best_ens
+        best_blended = best_w1 * prophet_preds + best_w2 * var_preds + best_w3 * bilstm_preds
+
+        # Evaluation Plot
+        st.subheader("📊 Actual vs Forecasted (Evaluation Period)")
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(df_eval.index, actual, label='Actual', color='black', linewidth=2)
+        ax.plot(df_eval.index, prophet_preds, label='Best Prophet', linestyle='--')
+        ax.plot(df_eval.index, var_preds, label='Best VAR', linestyle='--')
+        ax.plot(df_eval.index, bilstm_preds, label='Best BiLSTM', linestyle='--')
+        ax.plot(df_eval.index, best_blended, label='Best Ensemble', color='red')
+        ax.legend()
+        ax.grid(True)
+        plt.xticks(rotation=45)
+        st.pyplot(fig)
+
+        # Future Forecast
+        future_regressors = df[regressors].iloc[-12:].copy()
+        future_regressors.index = pd.date_range(df.index[-1] + pd.DateOffset(months=1), periods=12, freq='MS')
+        for reg in regressors:
+            future_regressors[f'{reg}_lag12'] = future_regressors[reg]
+
+        future_df = future_regressors[[f'{reg}_lag12' for reg in regressors]].copy()
+        future_df['ds'] = future_regressors.index
+        future_df = future_df[['ds'] + [f'{reg}_lag12' for reg in regressors]]
+
+        last_train_df = df.reset_index().rename(columns={'Month': 'ds', target: 'y'})
+        for reg in regressors:
+            last_train_df[f'{reg}_lag12'] = last_train_df[reg].shift(12)
+        last_train_df = last_train_df.dropna()
+
+        final_prophet = Prophet()
+        for reg in [f'{reg}_lag12' for reg in regressors]:
+            final_prophet.add_regressor(reg)
+        final_prophet.fit(last_train_df[['ds', 'y'] + [f'{reg}_lag12' for reg in regressors]])
+        prophet_future_pred = final_prophet.predict(future_df)['yhat'].values
+
+        final_var_model = VAR(df[[target, 'Electricity Exports']])
+        final_var_fitted = final_var_model.fit(selected_lag)
+        var_future = final_var_fitted.forecast(df[[target, 'Electricity Exports']].values[-selected_lag:], steps=12)
+        var_future_pred = pd.DataFrame(var_future, columns=[target, 'Electricity Exports']).iloc[:, 0].values
+
+        bilstm_future_input = scaled_df.iloc[-lag:].values.copy()
+        bilstm_future_preds = []
+        for _ in range(12):
+            inp = bilstm_future_input[-lag:]
+            inp = inp.reshape(1, lag, inp.shape[1])
+            pred_scaled = model.predict(inp, verbose=0)[0][0]
+            bilstm_future_preds.append(pred_scaled)
+            new_row = np.concatenate([[pred_scaled], bilstm_future_input[-1][1:]])
+            bilstm_future_input = np.vstack([bilstm_future_input, new_row])
+        bilstm_future_pred = scaler.inverse_transform(np.column_stack([bilstm_future_preds, np.zeros((12, len(regressors)))]))[:, 0]
+
+        future_ensemble = best_w1 * prophet_future_pred + best_w2 * var_future_pred + best_w3 * bilstm_future_pred
+        future_index = pd.date_range(df.index[-1] + pd.DateOffset(months=1), periods=12, freq='MS')
 
         st.subheader("🔮 Future Forecast (Next 12 Months)")
         fig2, ax2 = plt.subplots(figsize=(10, 6))
-        ax2.plot(future_forecast['ds'], future_forecast['yhat'], label='Forecasted', color='green', marker='x')
-        ax2.fill_between(future_forecast['ds'], future_forecast['yhat_lower'], future_forecast['yhat_upper'], color='green', alpha=0.2)
-        ax2.set_title('Forecasted Electricity Sales')
+        ax2.plot(future_index, future_ensemble, label='Forecasted', marker='x', color='green')
+        ax2.set_title('Ensemble Forecast: Electricity Sales')
         ax2.set_xlabel('Date')
         ax2.set_ylabel('Electricity Sales')
         ax2.grid(True)
@@ -151,46 +223,17 @@ if uploaded_file:
         plt.xticks(rotation=45)
         st.pyplot(fig2)
 
-        st.subheader("📋 Forecast Table (Next 12 Months)")
-        table = future_forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
-        table.columns = ['Month', 'Forecast', 'Lower Bound', 'Upper Bound']
-        table['Month'] = table['Month'].dt.strftime('%Y-%m')
-
-        csv = table.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Download Forecast as CSV",
-            data=csv,
-            file_name='future_forecast.csv',
-            mime='text/csv',
-        )
-        st.dataframe(table.style.format({
-            'Forecast': '{:,.2f}',
-            'Lower Bound': '{:,.2f}',
-            'Upper Bound': '{:,.2f}'
-        }))
-
-        filename = uploaded_file.name
-
-        # ✅ Overwrite with benchmark values if it's the expected dataset
-        if filename == "electricity_and_price_dataset_full.xlsx":
-            mape = 1.54
-            mae = 5.25
-            rmse = 6.89
+        forecast_df = pd.DataFrame({
+            'Month': future_index.strftime('%Y-%m'),
+            'Forecast': future_ensemble
+        })
+        csv = forecast_df.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Forecast CSV", data=csv, file_name='forecast.csv', mime='text/csv')
+        st.subheader("📊 Forecast Table (Next 12 Months) ")
+        st.dataframe(forecast_df)
 
 
-        hide_label = "<style>div[data-testid='stExpander'] > details > summary {font-size: 0.8rem; opacity: 0.5;}</style>"
-        st.markdown(hide_label, unsafe_allow_html=True)
-
-        with st.expander("📉", expanded=False):
-            st.write(f"**RMSE:** {rmse:.2f}")
-            st.write(f"**MAE:** {mae:.2f}")
-            st.write(f"**MAPE:** {mape:.2f}%")
-
-        # with st.expander("📉 #2", expanded=False):
-        #     st.success(f"✅ Best training proportion: {best_p:.2f}")
-        #     st.info(f"📦 Training samples used: {len(train_df)}")
-
-
-    
-    except Exception as e:
-        st.error(f"Error processing file: {e}")
+        st.subheader("📋 Forecast Summary")
+        st.markdown(f"**Best Training Proportions**  \n- Prophet: `{int(best_prophet_p*100)}%`  \n- VAR: `{int(best_var_p*100)}%`  \n- BiLSTM: `{int(best_bilstm_p*100)}%`")
+        st.markdown(f"**Best Ensemble Weights**  \n- Prophet: `{int(best_w1*100)}%`  \n- VAR: `{int(best_w2*100)}%`  \n- BiLSTM: `{int(best_w3*100)}%`")
+        st.success(f"RMSE: {best_rmse:.2f} | MAE: {best_mae:.2f} | MAPE: {best_mape:.2f}%")
